@@ -66,6 +66,14 @@ question includes all grants, while an exact device question includes org-wide p
 _Anything you had to work out that no document states. Invite lifecycle states are a common
 source of this._
 
+### 2026-09-26
+
+I applied “strictly lower role” literally and rejected owner-to-owner modification. The API suite
+then expected Dana to demote the other, non-last owner. That exposed a tension in the written
+matrix: last-owner protection only has useful meaning if one owner can demote another while at
+least one remains. I added that owner-only exception while retaining equal-role refusal for every
+other role.
+
 ## Phase 4 — devices and grants
 
 _What happens at the boundary where two grants disagree, or where a grant's scope and the
@@ -76,9 +84,24 @@ question's scope differ? Say what you predicted and what you got._
 _Two permissions, one device. What did you have to resolve, and in what order, to keep the two
 failure reasons distinguishable?_
 
+### 2026-09-26
+
+Kept `session:start` as the first check and the mode-specific device permission second. The API
+suite demonstrates why the ordering is observable: the same viewer receives `missing_permission`
+on a device without the start grant, but `missing_device_permission` when start is granted and
+control is not. Exclusive-session races are left to the partial unique index rather than a
+check-before-insert.
+
 ## Phase 6 — audit
 
 _What did you decide counts as an auditable event, and what pushed you to that line?_
+
+### 2026-09-26
+
+Denied administrative reads and mutations are auditable because the public suite explicitly
+looks for a denial with a reason code. I used a narrow wrapper around permission failures so the
+denial is recorded once, while successful state-change audit records can remain inside their
+transaction with the change.
 
 ## Phase 7 — the console
 

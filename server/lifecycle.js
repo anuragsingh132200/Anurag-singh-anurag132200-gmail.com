@@ -12,16 +12,41 @@
 //   - a permission change does NOT end a session in flight (grantfathering). Suspension,
 //     membership removal and device transfer DO. See PERMISSIONS.md §7.
 
-const todo = (name) =>
-  Object.assign(
-    new Error(`TODO: server/lifecycle.js — ${name}() is yours to write (BRIEF.md §3).`),
-    { code: 'NOT_IMPLEMENTED' }
-  );
+import { badRequest, forbidden, lastOwner } from './http.js';
+import { nowIso } from './db.js';
+import { resolve } from './permissions.js';
 
-export function roleRanks(db) { throw todo('roleRanks'); }
-export function assertRoleExists(db, role) { throw todo('assertRoleExists'); }
-export function assertCanModify(db, callerRole, targetRole) { throw todo('assertCanModify'); }
-export function assertNotLastOwner(db, orgId, userId) { throw todo('assertNotLastOwner'); }
-export function endActiveSessions(db, { orgId, userId, deviceId, reason, exceptSessionId }) { throw todo('endActiveSessions'); }
-export function snapshotAuthority(db, { userId, orgId, deviceId }) { throw todo('snapshotAuthority'); }
-export function sessionExpiry(db, orgId) { throw todo('sessionExpiry'); }
+export function roleRanks(db) {
+  return Object.fromEntries(db.prepare('SELECT key,rank FROM roles').all().map((row) => [row.key, row.rank]));
+}
+export function assertRoleExists(db, role) {
+  if (!db.prepare('SELECT 1 FROM roles WHERE key=?').get(role)) throw badRequest('unknown role');
+}
+export function assertCanModify(db, callerRole, targetRole) {
+  const ranks = roleRanks(db);
+  const ownersManagingOwners = callerRole === 'owner' && targetRole === 'owner';
+  if (ranks[callerRole] === undefined || ranks[targetRole] === undefined || (!ownersManagingOwners && ranks[callerRole] <= ranks[targetRole]))
+    throw forbidden('cannot modify a member at this role', 'role_hierarchy');
+}
+export function assertNotLastOwner(db, orgId, userId) {
+  const target = db.prepare("SELECT role,status FROM memberships WHERE org_id=? AND user_id=?").get(orgId, userId);
+  if (target?.role === 'owner' && target.status === 'active') {
+    const count = db.prepare("SELECT count(*) AS n FROM memberships WHERE org_id=? AND role='owner' AND status='active'").get(orgId).n;
+    if (count <= 1) throw lastOwner();
+  }
+}
+export function endActiveSessions(db, { orgId, userId, deviceId, reason, exceptSessionId }) {
+  const clauses = ["state='active'", 'org_id=?'];
+  const args = [orgId];
+  if (userId) { clauses.push('user_id=?'); args.push(userId); }
+  if (deviceId) { clauses.push('device_id=?'); args.push(deviceId); }
+  if (exceptSessionId) { clauses.push('id<>?'); args.push(exceptSessionId); }
+  return db.prepare(`UPDATE sessions SET state='ended',end_reason=?,ended_at=? WHERE ${clauses.join(' AND ')}`).run(reason, nowIso(), ...args);
+}
+export function snapshotAuthority(db, { userId, orgId, deviceId }) {
+  return JSON.stringify(resolve(db, { userId, orgId, deviceId }));
+}
+export function sessionExpiry(db, orgId) {
+  const row = db.prepare('SELECT max_session_minutes FROM organizations WHERE id=?').get(orgId);
+  return new Date(Date.now() + (row?.max_session_minutes ?? 60) * 60_000).toISOString();
+}

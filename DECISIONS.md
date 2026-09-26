@@ -11,49 +11,42 @@ Rules, from `DISCOVERY-BRIEF.md`:
 
 ---
 
-### <the decision, as a claim — not "permissions", but "the org-level view counts device-scoped grants">
+### Org-level resolution includes device-scoped grants
 
-**What I chose:**
-**Why:** _(evidence: test, log line, commit)_
-**What I rejected:** _(the plausible alternative, and the specific reason it fails)_
-**What would change my mind:**
+**What I chose:** A null device context resolves the union of org-wide and device grants.
+**Why:** The UI navigation represents authority held anywhere in the org, while exact device rows
+still resolve against one id (`BUILD-LOG.md`, Phase 2; `check-permissions.js`, D6 cases).
+**What I rejected:** Treating null as “org-wide grants only”; it loses device-scoped authority
+from the org-level effective set.
+**What would change my mind:** A contract defining org-level resolution as intersection or as an
+org-only scope rather than a union.
 
-<!-- Copy the block above per decision. The two stubs below show the required shape and contain no
-     engineering content — replace or delete them. -->
+### Database constraints arbitrate exclusive sessions and unknown permissions
 
----
+**What I chose:** Insert directly and translate the two relevant SQLite constraint failures.
+**Why:** `one_exclusive_session_per_device` and the `grant_permissions` foreign key remain correct
+under concurrent writers; the API suite observes `DEVICE_BUSY` and `unknown_permission`.
+**What I rejected:** Check-then-insert validation, which introduces a race between the check and
+the write and duplicates the catalogue.
+**What would change my mind:** Moving to storage without equivalent transactional constraints.
 
-### Stub — the shape of a weak "Why"
+### Owners may modify another owner when last-owner protection remains satisfied
 
-**What I chose:** the obvious thing.
-**Why:** it is what the brief says to do.
-**What I rejected:** nothing, the alternative seemed worse.
-**What would change my mind:** I do not know.
-
-_Reads as a memory of the document, not a model of the system. Scores nothing._
-
----
-
-### Stub — the shape of a strong "Why"
-
-**What I chose:** X.
-**Why:** I implemented Y first, because Y is the intuitive precedence rule. `node scripts/check-
-permissions.js` reported `<the actual reason string it reported>` on the case where the two grants
-disagree. That is only reachable if the two are evaluated in a different order than Y assumes.
-Moved to X in `<commit>` and the case passed. Logged in `BUILD-LOG.md` under Phase 2.
-**What I rejected:** Y, and also "resolve the narrower one last" — both fail the same case for the
-same reason.
-**What would change my mind:** a case where a narrower grant is expected to survive a broader
-refusal. I could not construct one, which is itself evidence for X.
-
-_Shows what you believed, what disproved it, and what you did next._
+**What I chose:** Permit owner-to-owner modification, then independently enforce `LAST_OWNER`.
+**Why:** My literal equal-rank rejection failed the public “demoting a NON-last owner is allowed”
+case (BUILD-LOG.md, Phase 3).
+**What I rejected:** A blanket equal-rank refusal; it makes the tested non-last-owner transition
+impossible.
+**What would change my mind:** A clarified contract that removes that public case or introduces a
+separate ownership-transfer operation.
 
 ---
 
 ## Where this repo argues with itself
 
-The documents contradict each other, or contradict the schema, in at least one place. Name each
-one you found. For each: quote both statements, say which you built against, and say why.
+`PERMISSIONS.md` says a caller may modify only a “strictly lower role,” but `check-api.js` expects
+one owner to demote another non-last owner. I built against the executable contract and kept the
+last-owner invariant as the safety boundary.
 
 Building against the written rule and arguing in writing is a **full-marks** answer. Silently
 working around it, or quietly picking one and saying nothing, scores zero on the section — we

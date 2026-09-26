@@ -1,17 +1,82 @@
-// Route registration. The router is deliberately tiny: createRouter() from
-// ../router.js, first match wins, so register specific paths before parameterised
-// ones ('/members/me' before '/members/:userId').
-//
-// YOURS TO WRITE. The file list is empty on purpose — every endpoint in BRIEF.md §5.1
-// is yours to add, and the response shapes the console reads are in §5.2.
-//
-// Suggested split, mirroring the API: auth, orgs (orgs + members + effective + audit),
-// invites, devices (devices + grants), sessions. Keep the registration order here.
-//
-// The server boots with this file empty: every /v1/* request returns 404 until you
-// register something. That is the intended starting line.
+import { send, badRequest, unauthenticated, notFound, conflict, gone, selfRoleChange, deviceBusy, HttpError, normalizeTs } from '../http.js';
+import { issueAccessToken, verifyPassword, hashPassword, newRefreshToken, hashRefreshToken, newInviteToken, hashInviteToken, REFRESH_TTL_SECONDS } from '../auth.js';
+import { newId, nowIso, bumpPermVersion } from '../db.js';
+import { resolve, resolveDevices, assertCan, assertMayGrant, assertCanStartSession } from '../permissions.js';
+import { assertRoleExists, assertCanModify, assertNotLastOwner, endActiveSessions, sessionExpiry } from '../lifecycle.js';
+import { audit, auditDenials } from '../audit.js';
 
-export function registerRoutes(router, deps) {
-  const { db, secret } = deps;
-  void db; void secret;
+const orgsFor = (db, uid) => db.prepare(`SELECT o.id,o.name,o.theme,m.role,m.perm_version AS permVersion FROM memberships m JOIN organizations o ON o.id=m.org_id WHERE m.user_id=? AND m.status='active' AND o.deleted_at IS NULL ORDER BY o.created_at`).all(uid);
+const activeMember = (db, oid, uid) => db.prepare("SELECT * FROM memberships WHERE org_id=? AND user_id=? AND status='active'").get(oid, uid);
+const deviceIn = (db, oid, id) => db.prepare('SELECT * FROM devices WHERE id=? AND org_id=? AND deleted_at IS NULL').get(id, oid);
+const cookie = (req, name) => String(req.headers.cookie ?? '').split(';').map(v => v.trim()).find(v => v.startsWith(`${name}=`))?.slice(name.length + 1);
+
+function accessFor(db, secret, uid, oid) {
+  const m = activeMember(db, oid, uid);
+  if (!m) throw unauthenticated('not an active member');
+  return { token: issueAccessToken({ userId: uid, orgId: oid, role: m.role, permVersion: m.perm_version }, secret), role: m.role };
+}
+function setRefresh(db, res, uid, family = newId('fam')) {
+  const raw = newRefreshToken(), expires = new Date(Date.now() + REFRESH_TTL_SECONDS * 1000).toISOString();
+  db.prepare('INSERT INTO refresh_tokens (id,user_id,token_hash,family_id,expires_at) VALUES (?,?,?,?,?)').run(newId('rft'), uid, hashRefreshToken(raw), family, expires);
+  res.setHeader('set-cookie', `rt=${raw}; Path=/v1/auth/refresh; HttpOnly; SameSite=Strict; Secure; Expires=${new Date(expires).toUTCString()}`);
+}
+
+export function registerRoutes(router, { db, secret }) {
+  router.post('/v1/auth/login', (ctx, p, res) => {
+    const email = String(ctx.body.email ?? '').trim().toLowerCase(), password = String(ctx.body.password ?? '');
+    if (!email || !password) throw badRequest('email and password are required');
+    const user = db.prepare('SELECT * FROM users WHERE email=?').get(email);
+    if (!user || !verifyPassword(password, user.password_hash)) throw unauthenticated('invalid email or password');
+    const orgs = orgsFor(db, user.id), selected = ctx.body.orgId ? orgs.find(o => o.id === ctx.body.orgId) : orgs[0];
+    if (!selected) throw unauthenticated('not an active member');
+    setRefresh(db, res, user.id);
+    send(res, 200, { ...accessFor(db, secret, user.id, selected.id), user: { id:user.id,email:user.email,name:user.name }, orgId:selected.id, orgs });
+  });
+  router.post('/v1/auth/refresh', (ctx, p, res) => {
+    const raw = cookie(ctx.req, 'rt'); if (!raw) throw unauthenticated('invalid refresh token');
+    const row = db.prepare('SELECT * FROM refresh_tokens WHERE token_hash=?').get(hashRefreshToken(raw));
+    if (!row || row.revoked_at || row.expires_at <= nowIso()) { if (row) db.prepare('UPDATE refresh_tokens SET revoked_at=? WHERE family_id=? AND revoked_at IS NULL').run(nowIso(), row.family_id); throw unauthenticated('invalid refresh token'); }
+    const orgs = orgsFor(db, row.user_id); if (!orgs.length) throw unauthenticated('not an active member');
+    db.prepare('UPDATE refresh_tokens SET revoked_at=? WHERE id=?').run(nowIso(), row.id); setRefresh(db, res, row.user_id, row.family_id);
+    send(res, 200, { ...accessFor(db, secret, row.user_id, orgs[0].id), user:db.prepare('SELECT id,email,name FROM users WHERE id=?').get(row.user_id), orgId:orgs[0].id, orgs });
+  });
+  router.post('/v1/auth/token', (ctx,p,res) => { const oid=String(ctx.body.orgId??''); send(res,200,{...accessFor(db,secret,ctx.userId,oid),orgId:oid}); });
+  router.get('/v1/auth/me', (ctx,p,res) => send(res,200,{ user:db.prepare('SELECT id,email,name FROM users WHERE id=?').get(ctx.userId),orgId:ctx.orgId,role:ctx.role,orgs:orgsFor(db,ctx.userId),permissions:resolve(db,ctx).permissions }));
+
+  router.get('/v1/orgs',(ctx,p,res)=>send(res,200,{orgs:orgsFor(db,ctx.userId)}));
+  router.post('/v1/orgs',(ctx,p,res)=>{ const name=String(ctx.body.name??'').trim(); if(!name||name.length>120)throw badRequest('valid organization name required'); const id=newId('org'); db.transaction(()=>{db.prepare('INSERT INTO organizations (id,name,theme) VALUES (?,?,?)').run(id,name,ctx.body.theme??'indigo');db.prepare("INSERT INTO memberships (id,org_id,user_id,role,status,joined_at) VALUES (?,?,?,'owner','active',?)").run(newId('mem'),id,ctx.userId,nowIso());audit(db,{orgId:id,actorId:ctx.userId,action:'org.create',targetType:'organization',targetId:id,result:'allow',requestId:ctx.requestId});})();send(res,201,{id,name,theme:ctx.body.theme??'indigo',role:'owner'});});
+  router.patch('/v1/orgs/:org',(ctx,p,res)=>{assertCan(db,ctx,'org:update');const name=String(ctx.body.name??'').trim();if(!name)throw badRequest('name required');db.prepare('UPDATE organizations SET name=? WHERE id=?').run(name,ctx.orgId);send(res,200,{id:ctx.orgId,name});});
+  router.delete('/v1/orgs/:org',(ctx,p,res)=>{assertCan(db,ctx,'org:delete');db.prepare('UPDATE organizations SET deleted_at=? WHERE id=?').run(nowIso(),ctx.orgId);send(res,200,{deleted:true});});
+
+  router.get('/v1/orgs/:org/members',(ctx,p,res)=>{assertCan(db,ctx,'user:read');send(res,200,{members:db.prepare(`SELECT u.id,u.email,u.name,m.role,m.status,m.perm_version FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.org_id=? AND m.status<>'removed' ORDER BY u.name`).all(ctx.orgId)});});
+  router.delete('/v1/orgs/:org/members/me',(ctx,p,res)=>{assertNotLastOwner(db,ctx.orgId,ctx.userId);db.transaction(()=>{db.prepare("UPDATE memberships SET status='removed',perm_version=perm_version+1 WHERE org_id=? AND user_id=?").run(ctx.orgId,ctx.userId);endActiveSessions(db,{orgId:ctx.orgId,userId:ctx.userId,reason:'membership_removed'});})();send(res,200,{removed:true});});
+  router.patch('/v1/orgs/:org/members/:userId',(ctx,p,res)=>{auditDenials(db,ctx,{action:'member.role',targetType:'user',targetId:p.userId},()=>{assertCan(db,ctx,'user:role:update');if(p.userId===ctx.userId)throw selfRoleChange();const t=activeMember(db,ctx.orgId,p.userId);if(!t)throw notFound();const role=String(ctx.body.role??'');assertRoleExists(db,role);assertCanModify(db,ctx.role,t.role);if(role==='owner'&&ctx.role!=='owner')throw new HttpError(403,'FORBIDDEN','only owners may confer owner','role_hierarchy');if(t.role==='owner'&&role!=='owner')assertNotLastOwner(db,ctx.orgId,p.userId);db.prepare('UPDATE memberships SET role=?,perm_version=perm_version+1 WHERE id=?').run(role,t.id);});send(res,200,{userId:p.userId,role:ctx.body.role});});
+  const statusRoute=(status,reason)=>(ctx,p,res)=>{assertCan(db,ctx,'user:remove');if(p.userId===ctx.userId)throw new HttpError(403,'FORBIDDEN','cannot change own membership','self');const t=db.prepare("SELECT * FROM memberships WHERE org_id=? AND user_id=? AND status IN ('active','suspended')").get(ctx.orgId,p.userId);if(!t)throw notFound();assertCanModify(db,ctx.role,t.role);if(status!=='active')assertNotLastOwner(db,ctx.orgId,p.userId);db.transaction(()=>{db.prepare('UPDATE memberships SET status=?,perm_version=perm_version+1 WHERE id=?').run(status,t.id);if(reason)endActiveSessions(db,{orgId:ctx.orgId,userId:p.userId,reason});})();send(res,200,{userId:p.userId,status});};
+  router.post('/v1/orgs/:org/members/:userId/suspend',statusRoute('suspended','user_suspended'));
+  router.delete('/v1/orgs/:org/members/:userId/suspend',statusRoute('active',null));
+  router.delete('/v1/orgs/:org/members/:userId',statusRoute('removed','membership_removed'));
+
+  router.post('/v1/orgs/:org/invites',(ctx,p,res)=>{assertCan(db,ctx,'user:invite');const email=String(ctx.body.email??'').trim().toLowerCase(),role=String(ctx.body.role??'');if(!email.includes('@'))throw badRequest('valid email required');assertRoleExists(db,role);const raw=newInviteToken(),expiresAt=new Date(Date.now()+7*86400_000).toISOString();try{db.prepare('INSERT INTO invites (id,org_id,email,role,token_hash,invited_by,expires_at) VALUES (?,?,?,?,?,?,?)').run(newId('inv'),ctx.orgId,email,role,hashInviteToken(raw),ctx.userId,expiresAt);}catch(e){if(e.code?.startsWith('SQLITE_CONSTRAINT'))throw conflict('live invite already exists');throw e;}send(res,201,{inviteToken:raw,email,role,expiresAt});});
+  router.get('/v1/orgs/:org/invites',(ctx,p,res)=>{assertCan(db,ctx,'user:invite');send(res,200,{invites:db.prepare('SELECT id,email,role,expires_at,accepted_at,revoked_at,created_at FROM invites WHERE org_id=?').all(ctx.orgId)});});
+  router.delete('/v1/orgs/:org/invites/:id',(ctx,p,res)=>{assertCan(db,ctx,'user:invite');const r=db.prepare('UPDATE invites SET revoked_at=? WHERE id=? AND org_id=? AND accepted_at IS NULL AND revoked_at IS NULL').run(nowIso(),p.id,ctx.orgId);if(!r.changes)throw notFound();send(res,200,{revoked:true});});
+  router.get('/v1/invites/:token',(ctx,p,res)=>{const i=db.prepare('SELECT i.*,o.name AS orgName FROM invites i JOIN organizations o ON o.id=i.org_id WHERE i.token_hash=?').get(hashInviteToken(p.token));if(!i)throw notFound();if(i.accepted_at||i.revoked_at)throw conflict('invite already used');if(i.expires_at<=nowIso())throw gone();send(res,200,{orgName:i.orgName,role:i.role,email:i.email,expiresAt:i.expires_at});});
+  router.post('/v1/invites/:token/accept',(ctx,p,res)=>{const i=db.prepare('SELECT * FROM invites WHERE token_hash=?').get(hashInviteToken(p.token));if(!i)throw notFound();if(i.accepted_at||i.revoked_at)throw conflict('invite already used');if(i.expires_at<=nowIso())throw gone();const name=String(ctx.body.name??'').trim(),password=String(ctx.body.password??'');if(!name||password.length<8)throw badRequest('name and password of at least 8 characters required');let u=db.prepare('SELECT * FROM users WHERE email=?').get(i.email);db.transaction(()=>{if(!u){const id=newId('usr');db.prepare('INSERT INTO users (id,email,name,password_hash) VALUES (?,?,?,?)').run(id,i.email,name,hashPassword(password));u={id};}const m=db.prepare('SELECT id FROM memberships WHERE org_id=? AND user_id=?').get(i.org_id,u.id);if(m)db.prepare("UPDATE memberships SET role=?,status='active',joined_at=?,perm_version=perm_version+1 WHERE id=?").run(i.role,nowIso(),m.id);else db.prepare("INSERT INTO memberships (id,org_id,user_id,role,status,invited_by,joined_at) VALUES (?,?,?,?,'active',?,?)").run(newId('mem'),i.org_id,u.id,i.role,i.invited_by,nowIso());const used=db.prepare('UPDATE invites SET accepted_at=?,accepted_by=? WHERE id=? AND accepted_at IS NULL').run(nowIso(),u.id,i.id);if(!used.changes)throw conflict('invite already used');})();send(res,200,{role:i.role});});
+
+  router.get('/v1/orgs/:org/devices',(ctx,p,res)=>{assertCan(db,ctx,'device:list');const ds=db.prepare('SELECT id,name,kind,online FROM devices WHERE org_id=? AND deleted_at IS NULL ORDER BY name').all(ctx.orgId),r=resolveDevices(db,{userId:ctx.userId,orgId:ctx.orgId,deviceIds:ds.map(d=>d.id)});send(res,200,{devices:ds.filter(d=>r.byDevice[d.id]['device:view'].effect==='allow').map(d=>({...d,online:Boolean(d.online),permissions:r.byDevice[d.id]}))});});
+  router.get('/v1/orgs/:org/devices/:id',(ctx,p,res)=>{const d=deviceIn(db,ctx.orgId,p.id);if(!d)throw notFound();assertCan(db,ctx,'device:view',d.id);send(res,200,{...d,online:Boolean(d.online),permissions:resolve(db,{...ctx,deviceId:d.id}).permissions});});
+  router.post('/v1/orgs/:org/devices',(ctx,p,res)=>{assertCan(db,ctx,'device:provision');const name=String(ctx.body.name??'').trim(),kind=String(ctx.body.kind??'');if(!name||!['macos','windows','linux','android','ios'].includes(kind))throw badRequest('valid name and kind required');const id=newId('dev');db.prepare('INSERT INTO devices (id,org_id,name,kind,online) VALUES (?,?,?,?,?)').run(id,ctx.orgId,name,kind,ctx.body.online?1:0);send(res,201,{id,name,kind,online:Boolean(ctx.body.online)});});
+  router.patch('/v1/orgs/:org/devices/:id',(ctx,p,res)=>{const d=deviceIn(db,ctx.orgId,p.id);if(!d)throw notFound();assertCan(db,ctx,'device:update',d.id);const name=String(ctx.body.name??'').trim();if(!name)throw badRequest('name required');db.prepare('UPDATE devices SET name=? WHERE id=?').run(name,d.id);send(res,200,{...d,name});});
+  router.delete('/v1/orgs/:org/devices/:id',(ctx,p,res)=>{const d=deviceIn(db,ctx.orgId,p.id);if(!d)throw notFound();assertCan(db,ctx,'device:provision',d.id);db.transaction(()=>{endActiveSessions(db,{orgId:ctx.orgId,deviceId:d.id,reason:'device_transferred'});db.prepare('UPDATE devices SET deleted_at=? WHERE id=?').run(nowIso(),d.id);})();send(res,200,{deleted:true});});
+
+  router.get('/v1/orgs/:org/grants',(ctx,p,res)=>{assertCan(db,ctx,'user:read');const grants=db.prepare(`SELECT g.*,group_concat(gp.permission) AS permission_list FROM grants g JOIN grant_permissions gp ON gp.grant_id=g.id WHERE g.org_id=? AND g.revoked_at IS NULL GROUP BY g.id ORDER BY g.created_at`).all(ctx.orgId).map(g=>({...g,permissions:g.permission_list.split(',')}));send(res,200,{grants});});
+  router.post('/v1/orgs/:org/grants',(ctx,p,res)=>{assertCan(db,ctx,'grant:create');const {userId,deviceId=null}=ctx.body,ps=ctx.body.permissions;if(!Array.isArray(ps)||!ps.length||ps.some(x=>typeof x!=='string'))throw badRequest('permissions must be a non-empty array');if(!['allow','deny'].includes(ctx.body.effect))throw badRequest('invalid effect');if(userId===ctx.userId)throw new HttpError(403,'FORBIDDEN','self grants forbidden','self_grant');if(!activeMember(db,ctx.orgId,userId))throw notFound();if(deviceId&&!deviceIn(db,ctx.orgId,deviceId))throw notFound();const startsAt=normalizeTs(ctx.body.startsAt,'startsAt'),expiresAt=normalizeTs(ctx.body.expiresAt,'expiresAt');if(expiresAt&&expiresAt<=nowIso())throw new HttpError(400,'GRANT_EXPIRED','expiry must be in future','expired_grant');assertMayGrant(db,ctx,ps,deviceId);const id=newId('grt');try{db.transaction(()=>{db.prepare('INSERT INTO grants (id,org_id,user_id,device_id,effect,starts_at,expires_at,created_by) VALUES (?,?,?,?,?,?,?,?)').run(id,ctx.orgId,userId,deviceId,ctx.body.effect,startsAt,expiresAt,ctx.userId);const ins=db.prepare('INSERT INTO grant_permissions (grant_id,permission) VALUES (?,?)');for(const x of new Set(ps))ins.run(id,x);bumpPermVersion(db,{orgId:ctx.orgId,userId});})();}catch(e){if(e.code?.startsWith('SQLITE_CONSTRAINT_FOREIGNKEY'))throw badRequest('unknown permission','unknown_permission');throw e;}send(res,201,{id,userId,deviceId,effect:ctx.body.effect,permissions:ps});});
+  router.delete('/v1/orgs/:org/grants/:id',(ctx,p,res)=>{assertCan(db,ctx,'grant:revoke');const g=db.prepare('SELECT * FROM grants WHERE id=? AND org_id=? AND revoked_at IS NULL').get(p.id,ctx.orgId);if(!g)throw notFound();db.transaction(()=>{db.prepare('UPDATE grants SET revoked_at=? WHERE id=?').run(nowIso(),g.id);bumpPermVersion(db,{orgId:ctx.orgId,userId:g.user_id});})();send(res,200,{revoked:true});});
+
+  router.post('/v1/orgs/:org/sessions',(ctx,p,res)=>{const did=String(ctx.body.deviceId??''),mode=String(ctx.body.mode??'');if(!deviceIn(db,ctx.orgId,did))throw notFound();const authority=assertCanStartSession(db,ctx,mode,did),id=newId('ses');try{db.prepare("INSERT INTO sessions (id,org_id,user_id,device_id,mode,state,authorized_by,expires_at) VALUES (?,?,?,?,?,'active',?,?)").run(id,ctx.orgId,ctx.userId,did,mode,JSON.stringify(authority),sessionExpiry(db,ctx.orgId));}catch(e){if(e.code?.startsWith('SQLITE_CONSTRAINT_UNIQUE')){const held=db.prepare("SELECT id FROM sessions WHERE device_id=? AND state='active' AND mode IN ('control','terminal')").get(did);throw deviceBusy(`device already held by ${held?.id??'another session'}`);}throw e;}send(res,201,db.prepare('SELECT * FROM sessions WHERE id=?').get(id));});
+  router.get('/v1/orgs/:org/sessions',(ctx,p,res)=>{assertCan(db,ctx,'session:view');const now=nowIso();db.prepare("UPDATE sessions SET state='ended',end_reason='session_expired',ended_at=? WHERE org_id=? AND state='active' AND expires_at<=?").run(now,ctx.orgId,now);send(res,200,{sessions:db.prepare('SELECT * FROM sessions WHERE org_id=? ORDER BY started_at DESC').all(ctx.orgId)});});
+  router.get('/v1/sessions/:id',(ctx,p,res)=>{const s=db.prepare('SELECT * FROM sessions WHERE id=? AND org_id=?').get(p.id,ctx.orgId);if(!s)throw notFound();if(s.user_id!==ctx.userId)assertCan(db,ctx,'session:view',s.device_id);send(res,200,s);});
+  router.delete('/v1/sessions/:id',(ctx,p,res)=>{const s=db.prepare("SELECT * FROM sessions WHERE id=? AND org_id=? AND state='active'").get(p.id,ctx.orgId);if(!s)throw notFound();const own=s.user_id===ctx.userId;if(!own)assertCan(db,ctx,'session:terminate',s.device_id);db.prepare("UPDATE sessions SET state='ended',end_reason=?,ended_at=? WHERE id=?").run(own?'user_stopped':'admin_terminated',nowIso(),s.id);send(res,200,{ended:true});});
+
+  router.get('/v1/orgs/:org/users/:userId/effective',(ctx,p,res)=>{if(p.userId!==ctx.userId)assertCan(db,ctx,'user:read');if(!activeMember(db,ctx.orgId,p.userId))throw notFound();send(res,200,resolve(db,{userId:p.userId,orgId:ctx.orgId}));});
+  router.get('/v1/orgs/:org/audit',(ctx,p,res)=>{auditDenials(db,ctx,{action:'audit.read',targetType:'organization',targetId:ctx.orgId},()=>assertCan(db,ctx,'audit:read'));const limit=ctx.query.has('limit')?Number(ctx.query.get('limit')):50,offset=ctx.query.has('offset')?Number(ctx.query.get('offset')):0;if(!Number.isInteger(limit)||limit<1||limit>200||!Number.isInteger(offset)||offset<0)throw badRequest('invalid pagination');send(res,200,{events:db.prepare('SELECT * FROM audit_events WHERE org_id=? ORDER BY at DESC LIMIT ? OFFSET ?').all(ctx.orgId,limit,offset)});});
 }
