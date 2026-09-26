@@ -7,6 +7,7 @@
 //       npm run build && npm start
 
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 
@@ -37,7 +38,7 @@ const PUBLIC_ROUTES = new Set([
 // The request pipeline. Read this top to bottom and you know how the app works.
 // ---------------------------------------------------------------------------
 async function handleApi(req, res, url) {
-  const requestId = `req_${crypto.randomUUID().slice(0, 8)}`;
+  const requestId = `req_${randomUUID().slice(0, 8)}`;
 
   try {
     const hit = router.match(req.method, url.pathname);

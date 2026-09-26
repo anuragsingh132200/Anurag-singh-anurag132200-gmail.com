@@ -29,15 +29,37 @@ Note: this is the failure mode where a passing test is worse than a failing one.
 _Installed, reset the database, read the documents, ran the suites against the untouched skeleton.
 What did the starting line actually look like, and which failure surprised you?_
 
+### 2026-09-26
+
+Read the schema before the routes and expected the stubs to boot far enough for isolated tests.
+The starting point had no dependency tree and no Git history in `starter/`, so I preserved the
+generated hand-out as the root commit before changing it. The first useful split was to keep
+token parsing independent of membership freshness: malformed credentials are 401s, while
+cross-org route names are deliberately hidden as 404s after a valid token is decoded.
+
 ## Phase 1 — token verification
 
 _What did you expect each failure mode to look like before you ran it? Which one behaved
 differently from your expectation, and what did that tell you?_
 
+### 2026-09-26
+
+Expected `Buffer.from(value, 'base64url')` to reject invalid alphabet characters. It is lenient,
+so decoding alone would accept malformed segments. Added an explicit base64url alphabet check
+before JSON parsing and made every structural, signature, and claim failure converge on the same
+`401 UNAUTHENTICATED` error.
+
 ## Phase 2 — caller context and the resolution engine
 
 _This is where most people's first model is wrong. Write down the model you started with, the
 observation that broke it, and the model you moved to. Be specific about the observation._
+
+### 2026-09-26
+
+My first query shape treated a null device as matching only org-wide grants. The documented
+org-level view is instead a union and must include device-scoped grants, which is also what makes
+navigation reflect authority held anywhere in an org. I changed the scope predicate so a null
+question includes all grants, while an exact device question includes org-wide plus that device.
 
 ## Phase 3 — orgs, members, invites
 

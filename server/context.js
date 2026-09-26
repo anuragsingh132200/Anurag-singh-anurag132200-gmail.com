@@ -16,14 +16,23 @@
 // authenticate(db, secret) returns (req, params) => caller, where caller carries at
 // least { userId, orgId, role, membership, claims }.
 
-const todo = () =>
-  Object.assign(
-    new Error('TODO: server/context.js — authenticate() is yours to write (BRIEF.md §3).'),
-    { code: 'NOT_IMPLEMENTED' }
-  );
+import { verifyAccessToken, assertFresh } from './auth.js';
+import { unauthenticated, notFound, forbidden } from './http.js';
 
 export function authenticate(db, secret) {
   return function buildContext(req, params) {
-    throw todo();
+    const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
+    if (!match) throw unauthenticated();
+    const claims = verifyAccessToken(match[1], secret);
+    if (!claims.sub || !claims.org) throw unauthenticated('invalid access token');
+    if (params.org && params.org !== claims.org) throw notFound();
+    const membership = db.prepare(`SELECT m.*, u.email, u.name, o.deleted_at AS org_deleted
+      FROM memberships m JOIN users u ON u.id=m.user_id JOIN organizations o ON o.id=m.org_id
+      WHERE m.user_id=? AND m.org_id=?`).get(claims.sub, claims.org);
+    assertFresh(claims, membership);
+    if (membership.org_deleted || membership.status === 'removed') throw unauthenticated('not an active member');
+    if (membership.status === 'suspended') throw forbidden('membership suspended', 'suspended');
+    if (membership.status !== 'active') throw unauthenticated('not an active member');
+    return { userId: claims.sub, orgId: claims.org, role: membership.role, membership, claims };
   };
 }

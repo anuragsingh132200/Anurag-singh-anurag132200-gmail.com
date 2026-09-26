@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
 
 // ############################################################################
 // # These four pragmas are NOT optional and are NOT a one-time setup step.    #
@@ -22,7 +23,7 @@ export function openDatabase(file = process.env.DATABASE_FILE ?? 'app.db') {
 export const nowIso = () => new Date().toISOString();
 
 export function newId(prefix) {
-  const rand = crypto.randomUUID().replaceAll('-', '').slice(0, 16);
+  const rand = randomUUID().replaceAll('-', '').slice(0, 16);
   return `${prefix}_${rand}`;
 }
 
