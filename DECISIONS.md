@@ -40,6 +40,37 @@ impossible.
 **What would change my mind:** A clarified contract that removes that public case or introduces a
 separate ownership-transfer operation.
 
+### Access tokens stay in component memory
+
+**What I chose:** Keep access tokens in React state and recover only through the refresh cookie.
+**Why:** The browser contract checks both web-storage namespaces and then reloads the page; both
+cases pass in the final 25/25 run.
+**What I rejected:** `localStorage`, because a script injection could read a long-lived bearer and
+because it directly violates the storage assertion.
+**What would change my mind:** A browser platform primitive that is script-inaccessible while
+still supporting an Authorization header without a server-mediated refresh.
+
+### Device list responses carry batched row-level decisions
+
+**What I chose:** Resolve the catalogue for each returned device in the server response and let
+React render those decisions verbatim.
+**Why:** The architecture browser case intercepts the devices response, changes control to deny,
+and the button disappears; the final run passes that case.
+**What I rejected:** A frontend role matrix and per-row HTTP lookups. The former diverges from the
+database; the latter produces N extra requests.
+**What would change my mind:** An API contract that returns a pre-filtered action list instead of
+resolved permission objects.
+
+### Transfers revoke device-scoped grants from the source organization
+
+**What I chose:** End sessions, revoke source device grants, bump affected memberships, then move
+the device in one transaction.
+**Why:** Leaving those rows live produces grants whose `org_id` and device's `org_id` disagree,
+creating a cross-scope authority seam not prevented by the current schema.
+**What I rejected:** Updating only `devices.org_id`; it preserves invalid authorization links.
+**What would change my mind:** A schema-level composite foreign key that moves or rejects every
+dependent scoped grant atomically under a defined policy.
+
 ---
 
 ## Where this repo argues with itself

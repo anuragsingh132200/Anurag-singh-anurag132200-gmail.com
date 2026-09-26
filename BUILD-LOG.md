@@ -107,10 +107,26 @@ transaction with the change.
 
 _Where did the server's answer and your instinct disagree about what should be on screen?_
 
+### 2026-09-26
+
+I initially wanted to derive navigation from the active role because it is already displayed in
+the shell. That would duplicate the server catalogue and fail for the personalized role. The UI
+instead reads only resolved responses, and device actions read each row's own set. The client
+holds the access token only in React state; reload recovery goes through the httpOnly cookie.
+
 ## Phase 8 — hardening
 
 _What did you measure, what did you fix, and what did you deliberately leave alone? Anything you
 chose not to build belongs here with its reason._
+
+### 2026-09-26
+
+The first complete browser run passed 24/25 cases in 24.8 seconds. The failure was visual rather
+than authorization: I had styled an `ember` theme while the fixture returns `amber`, so the
+computed shell background did not change. I corrected the data-driven selector; the next run
+passed 25/25 in 13.5 seconds. I also reviewed the endpoint table after the public suites and found
+device transfer was unexercised, then added it with two-org permission checks, session cascading,
+and revocation of grants that would otherwise become cross-org grants.
 
 ## Open threads
 

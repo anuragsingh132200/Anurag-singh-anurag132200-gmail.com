@@ -77,6 +77,7 @@ export function verifyAccessToken(token, secret) {
     const parts = token.split('.');
     if (parts.length !== 3 || parts.some((part) => !/^[A-Za-z0-9_-]+$/.test(part))) reject();
     const [encodedHeader, encodedPayload, encodedSignature] = parts;
+    if (parts.some((part) => b64(unb64(part)) !== part)) reject();
     const header = JSON.parse(unb64(encodedHeader).toString('utf8'));
     const claims = JSON.parse(unb64(encodedPayload).toString('utf8'));
     if (!header || typeof header !== 'object' || Array.isArray(header) ||
